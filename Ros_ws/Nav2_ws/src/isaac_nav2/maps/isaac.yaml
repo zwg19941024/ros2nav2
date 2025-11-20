@@ -1,0 +1,7 @@
+image: isaac.pgm
+mode: trinary
+resolution: 0.01
+origin: [-3.24, -5.05, 0]
+negate: 0
+occupied_thresh: 0.65
+free_thresh: 0.25

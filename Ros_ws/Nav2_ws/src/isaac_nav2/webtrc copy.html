@@ -1,0 +1,247 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>WebRTC D435 Receiver</title>
+    <script src="https://unpkg.com/mqtt/dist/mqtt.min.js"></script>
+    <style>
+        html, body {
+            margin: 0;
+            padding: 0;
+            width: 100%;
+            height: 100%;
+            overflow: hidden;
+            background-color: #000;
+        }
+        
+        video {
+            width: 100%;
+            height: 100%;
+            object-fit: contain;
+            background-color: #000;
+        }
+        
+        #status {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            color: white;
+            background-color: rgba(0,0,0,0.7);
+            padding: 8px 15px;
+            border-radius: 5px;
+            font-family: Arial, sans-serif;
+            font-size: 14px;
+            z-index: 10;
+        }
+    </style>
+</head>
+<body>
+    <video id="video" autoplay playsinline muted></video>
+
+
+    <script>
+        const videoEl = document.getElementById('video');
+        const statusEl = document.getElementById('status');
+        
+        const MQTT_BROKER_URL = 'ws://118.31.73.84:8083';
+        const MQTT_OFFER_TOPIC = 'webrtc/offer';
+        const MQTT_ICE_CANDIDATE_TOPIC = 'webrtc/ice_candidate';
+        const RECONNECT_DELAY = 5000;
+
+        let pc = null;
+        let mqttClient = null;
+        let clientUuid = null;
+        let reconnectTimer = null;
+        let isConnected = false;
+        let disconnectTimer = null;
+
+        // 页面加载后自动连接
+        window.addEventListener('load', start);
+
+
+        function start() {
+            // 重置连接状态
+            isConnected = false;
+            clientUuid = 'browser-' + crypto.randomUUID();
+            
+            // 清理之前的连接
+            if (pc) {
+                pc.close();
+                pc = null;
+            }
+            
+            if (mqttClient) {
+                mqttClient.end();
+                mqttClient = null;
+            }
+            
+            // 清理定时器
+            if (disconnectTimer) {
+                clearTimeout(disconnectTimer);
+                disconnectTimer = null;
+            }
+            
+            mqttClient = mqtt.connect(MQTT_BROKER_URL);
+
+            mqttClient.on('connect', async () => {
+                isConnected = true;
+                const answerTopic = `webrtc/answer/${clientUuid}`;
+                const iceTopic = `webrtc/ice_candidate/${clientUuid}`;
+                
+                mqttClient.subscribe([answerTopic, iceTopic], (err) => {
+                    if (!err) {
+                        createAndSendOffer();
+                    } else {
+                        isConnected = false;
+                        scheduleReconnect();
+                    }
+                });
+            });
+
+            mqttClient.on('message', async (topic, message) => {
+                try {
+                    const data = JSON.parse(message.toString());
+                    
+                    if (topic === `webrtc/answer/${clientUuid}`) {
+                        if (pc && pc.signalingState === 'have-local-offer') {
+                            await pc.setRemoteDescription(new RTCSessionDescription(data));
+                            
+                        }
+                    } else if (topic === `webrtc/ice_candidate/${clientUuid}`) {
+                        if (pc && pc.remoteDescription) {
+                            await pc.addIceCandidate(new RTCIceCandidate(data));
+                        }
+                    }
+                } catch (error) {
+                    
+                }
+            });
+
+            mqttClient.on('error', (err) => {
+                // 只有在已经连接过的情况下才标记为断开
+                if (isConnected) {
+                    isConnected = false;
+                    scheduleReconnect();
+                }
+            });
+
+            mqttClient.on('close', () => {
+                // 只有在已经连接过的情况下才标记为断开并重连
+                if (isConnected) {
+                    isConnected = false;
+                    scheduleReconnect();
+                }
+            });
+        }
+
+        function scheduleReconnect() {
+            // 清理现有的定时器
+            if (reconnectTimer) clearTimeout(reconnectTimer);
+            if (disconnectTimer) {
+                clearTimeout(disconnectTimer);
+                disconnectTimer = null;
+            }
+            
+            reconnectTimer = setTimeout(() => {
+                start();
+            }, RECONNECT_DELAY);
+        }
+
+        async function createAndSendOffer() {
+            try {
+                const configuration = { 
+                    iceServers: [
+                        { urls: 'stun:stun.l.google.com:19302' },
+                        { urls: 'stun:stun1.l.google.com:19302' },
+                        { urls: 'stun:stun.miwifi.com:3478' },
+                        { urls: 'stun:stun.qq.com:3478' },
+                        { urls: 'turn:openrelay.metered.ca:80', username: 'openrelayproject', credential: 'openrelayproject' },
+                        { urls: 'turn:openrelay.metered.ca:443?transport=tcp', username: 'openrelayproject', credential: 'openrelayproject' },
+                        { urls: 'turn:openrelay.metered.ca:443', username: 'openrelayproject', credential: 'openrelayproject' },
+                    ],
+                    iceTransportPolicy: 'all'
+                };
+                
+                pc = new RTCPeerConnection(configuration);
+
+                // 监听轨道添加事件
+                pc.ontrack = (event) => {
+                    if (event.streams && event.streams[0]) {
+                        videoEl.srcObject = event.streams[0];
+                    }
+                };
+
+                // 监听ICE候选
+                pc.onicecandidate = (event) => {
+                    if (event.candidate) {
+                        const candidatePayload = JSON.stringify({
+                            uuid: clientUuid,
+                            type: 'candidate',
+                            candidate: event.candidate.candidate,
+                            sdpMid: event.candidate.sdpMid,
+                            sdpMLineIndex: event.candidate.sdpMLineIndex,
+                        });
+                        // 将客户端的ICE候选发布到专属UUID主题，服务端才能正确路由
+                        mqttClient.publish(`${MQTT_ICE_CANDIDATE_TOPIC}/${clientUuid}`, candidatePayload);
+                    }
+                };
+
+                // 监听ICE连接状态
+                pc.oniceconnectionstatechange = () => {
+                    if (pc.iceConnectionState === 'connected' || 
+                        pc.iceConnectionState === 'completed') {
+                        // 清除之前的断开定时器
+                        if (disconnectTimer) {
+                            clearTimeout(disconnectTimer);
+                            disconnectTimer = null;
+                        }
+                    } else if (pc.iceConnectionState === 'disconnected') {
+                        // disconnected状态给10秒时间让它自己恢复
+                        // 如果10秒后还没恢复，才触发重连
+                        if (disconnectTimer) {
+                            clearTimeout(disconnectTimer);
+                        }
+                        disconnectTimer = setTimeout(() => {
+                            if (pc && pc.iceConnectionState === 'disconnected') {
+                                scheduleReconnect();
+                            }
+                        }, 10000); // 10秒后检查
+                    } else if (pc.iceConnectionState === 'failed' || 
+                               pc.iceConnectionState === 'closed') {
+                        // failed或closed状态立即重连
+                        scheduleReconnect();
+                    }
+                };
+                
+                // ---------> 新增代码开始 <---------
+                // 添加一个视频收发器，并设置编码参数，禁用 simulcast
+                const transceiver = pc.addTransceiver('video', {
+                    'direction': 'recvonly'
+                });
+                // 这一步在某些浏览器上可能有助于协商过程，但对于接收端不是强制的
+                // ---------> 新增代码结束 <---------
+
+
+                // 创建并发送Offer
+                const offer = await pc.createOffer({
+                    offerToReceiveVideo: true,
+                    offerToReceiveAudio: false
+                });
+                
+                await pc.setLocalDescription(offer);
+                
+                const offerPayload = JSON.stringify({
+                    uuid: clientUuid,
+                    sdp: offer.sdp,
+                    type: offer.type
+                });
+
+                mqttClient.publish(MQTT_OFFER_TOPIC, offerPayload);
+
+            } catch (error) {
+   
+                scheduleReconnect();
+            }
+        }
+    </script>
+</body>
+</html>
